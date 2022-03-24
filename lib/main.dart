@@ -2,94 +2,153 @@ import 'dart:async';
 import 'dart:isolate';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_activity_recognition/flutter_activity_recognition.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:shared_preferences_android/shared_preferences_android.dart';
+import 'package:workmanager/workmanager.dart';
 
-void main() => runApp(const ExampleApp());
+const simplePeriodicTask = "simplePeriodicTask";
 
-// The callback function should always be a top-level function.
+void callbackDispatcher() {
+  Workmanager().executeTask((task, inputData) {
+    print(
+        "Native called background task: $task"); //simpleTask will be emitted here.
+
+    return Future.value(true);
+  });
+}
+
 void startCallback() {
   // The setTaskHandler function must be called to handle the task in the background.
   FlutterForegroundTask.setTaskHandler(FirstTaskHandler());
 }
 
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  /*Workmanager().initialize(
+      callbackDispatcher, // The top level function, aka callbackDispatcher
+      isInDebugMode:
+          true // If enabled it will post a notification whenever the task is running. Handy for debugging tasks
+      );
+
+  Workmanager().registerPeriodicTask(
+    "uniqueTaskName",
+    simplePeriodicTask,
+    frequency: const Duration(minutes: 15),
+  );*/
+
+  runApp(const ExampleApp());
+}
+
+// The callback function should always be a top-level function.
+
 class FirstTaskHandler extends TaskHandler {
-  StreamSubscription<Position>? streamSubscription;
+  StreamSubscription<Position>? _gpsSubscription;
+  StreamSubscription<Activity>? _activitySubscription;
 
-  /// Determine the current position of the device.
-  ///
-  /// When the location services are not enabled or permissions
-  /// are denied the `Future` will return an error.
-  Future<Position> _determinePosition() async {
-    bool serviceEnabled;
-    LocationPermission permission;
+  FlutterActivityRecognition? _activityRecognition;
+  ActivityType _activityType = ActivityType.UNKNOWN;
+  ActivityConfidence _activityConfidence = ActivityConfidence.LOW;
 
-    // Test if location services are enabled.
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      // Location services are not enabled don't continue
-      // accessing the position and request users of the
-      // App to enable the location services.
-      return Future.error('Location services are disabled.');
-    }
-
-    permission = await Geolocator.checkPermission();
-
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-      if (permission == LocationPermission.denied) {
-        // Permissions are denied, next time you could try
-        // requesting permissions again (this is also where
-        // Android's shouldShowRequestPermissionRationale
-        // returned true. According to Android guidelines
-        // your App should show an explanatory UI now.
-        return Future.error('Location permissions are denied');
-      }
-    }
-
-    if (permission == LocationPermission.deniedForever) {
-      // Permissions are denied forever, handle appropriately.
-      return Future.error(
-          'Location permissions are permanently denied, we cannot request permissions.');
-    }
-
-    // When we reach here, permissions are granted and we can
-    // continue accessing the position of the device.
-    return await Geolocator.getCurrentPosition();
-  }
+  int _updateCount = 0;
 
   @override
   Future<void> onStart(DateTime timestamp, SendPort? sendPort) async {
-    await _determinePosition();
+    listenActivityRecognitionUpdates();
+  }
 
-    final positionStream = Geolocator.getPositionStream();
-    streamSubscription = positionStream.listen((event) {
-      // Update notification content.
-      FlutterForegroundTask.updateService(
-          notificationTitle: 'Current Position',
-          notificationText: '${event.latitude}, ${event.longitude}');
+  listenActivityRecognitionUpdates() {
+    _activityRecognition = FlutterActivityRecognition.instance;
 
-      // Send data to the main isolate.
-      sendPort?.send(event);
-    });
+    if (_activityRecognition != null) {
+      print("Start listening activity recognition updates.");
+
+      _activitySubscription =
+          _activityRecognition?.activityStream.listen((event) {
+        if (event.type != ActivityType.UNKNOWN) {
+          FlutterForegroundTask.updateService(
+            notificationTitle: event.type.name,
+            notificationText: event.confidence.name,
+          );
+
+          _activityType = event.type;
+          _activityConfidence = event.confidence;
+        }
+
+        print("Activity: ${event.type.name} (${event.confidence.name})");
+      });
+    }
+  }
+
+  cleanListeners() async {
+    print("Cleaning background listeners");
+
+    await _activitySubscription?.cancel();
+    await _gpsSubscription?.cancel();
+
+    _activitySubscription = null;
+    _gpsSubscription = null;
+
+    _activityRecognition = null;
   }
 
   @override
   Future<void> onEvent(DateTime timestamp, SendPort? sendPort) async {
-    FlutterForegroundTask.updateService(
-      notificationTitle: 'FirstTaskHandler',
-      notificationText: timestamp.toString(),
-    );
+    print("Foreground tick at: ${DateTime.now()}");
+    _updateCount++;
 
-    // Send data to the main isolate.
-    sendPort?.send(timestamp);
+    if (_updateCount == 360) {
+      print("Resetting service components");
+
+      _updateCount = 0;
+
+      await cleanListeners();
+      await listenActivityRecognitionUpdates();
+
+      return;
+    }
+
+    if (_activityType == ActivityType.STILL &&
+        _activityConfidence == ActivityConfidence.HIGH) {
+      if (_gpsSubscription != null) {
+        await _gpsSubscription?.cancel();
+        _gpsSubscription = null;
+      }
+
+      FlutterForegroundTask.updateService(
+        notificationTitle: 'Gps Module',
+        notificationText: 'Stopped',
+      );
+    } else if (_activityType != ActivityType.UNKNOWN) {
+      _gpsSubscription ??= Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.best,
+          distanceFilter: 5,
+        ),
+      ).listen((event) {
+        // Update notification content.
+        FlutterForegroundTask.updateService(
+            notificationTitle: 'Current Position',
+            notificationText: '${event.latitude}, ${event.longitude}');
+
+        // Send data to the main isolate.
+        // sendPort?.send(event);
+
+        print("GpsEvent: ${event.latitude}, ${event.longitude}");
+      });
+    }
   }
 
   @override
   Future<void> onDestroy(DateTime timestamp) async {
     // You can use the clearAllData function to clear all the stored data.
-    await streamSubscription?.cancel();
-    await FlutterForegroundTask.clearAllData();
+    await _gpsSubscription?.cancel();
+    await _activitySubscription?.cancel();
+
+    _gpsSubscription = null;
+    _activitySubscription = null;
   }
 
   @override
@@ -97,28 +156,6 @@ class FirstTaskHandler extends TaskHandler {
     // Called when the notification button on the Android platform is pressed.
     print('onButtonPressed >> $id');
   }
-}
-
-void updateCallback() {
-  FlutterForegroundTask.setTaskHandler(SecondTaskHandler());
-}
-
-class SecondTaskHandler extends TaskHandler {
-  @override
-  Future<void> onStart(DateTime timestamp, SendPort? sendPort) async {}
-
-  @override
-  Future<void> onEvent(DateTime timestamp, SendPort? sendPort) async {
-    FlutterForegroundTask.updateService(
-        notificationTitle: 'SecondTaskHandler',
-        notificationText: timestamp.toString());
-
-    // Send data to the main isolate.
-    sendPort?.send(timestamp);
-  }
-
-  @override
-  Future<void> onDestroy(DateTime timestamp) async {}
 }
 
 class ExampleApp extends StatefulWidget {
@@ -130,6 +167,7 @@ class ExampleApp extends StatefulWidget {
 
 class _ExampleAppState extends State<ExampleApp> {
   ReceivePort? _receivePort;
+  late FlutterActivityRecognition activityRecognition;
 
   Future<void> _initForegroundTask() async {
     await FlutterForegroundTask.init(
@@ -164,9 +202,6 @@ class _ExampleAppState extends State<ExampleApp> {
   }
 
   Future<bool> _startForegroundTask() async {
-    // You can save data using the saveData function.
-    await FlutterForegroundTask.saveData(key: 'customData', value: 'hello');
-
     ReceivePort? receivePort;
     if (await FlutterForegroundTask.isRunningService) {
       receivePort = await FlutterForegroundTask.restartService();
@@ -180,7 +215,7 @@ class _ExampleAppState extends State<ExampleApp> {
 
     if (receivePort != null) {
       _receivePort = receivePort;
-      _receivePort?.listen((message) {
+      _receivePort?.listen((message) async {
         if (message is DateTime) {
           print('receive timestamp: $message');
         } else if (message is int) {
@@ -201,6 +236,9 @@ class _ExampleAppState extends State<ExampleApp> {
   @override
   void initState() {
     super.initState();
+    activityRecognition = FlutterActivityRecognition.instance;
+    isPermissionGrants();
+
     _initForegroundTask();
   }
 
@@ -244,5 +282,23 @@ class _ExampleAppState extends State<ExampleApp> {
       child: Text(text),
       onPressed: onPressed,
     );
+  }
+
+  Future<bool> isPermissionGrants() async {
+    // Check if the user has granted permission. If not, request permission.
+    PermissionRequestResult reqResult;
+    reqResult = await activityRecognition.checkPermission();
+    if (reqResult == PermissionRequestResult.PERMANENTLY_DENIED) {
+      print('Permission is permanently denied.');
+      return false;
+    } else if (reqResult == PermissionRequestResult.DENIED) {
+      reqResult = await activityRecognition.requestPermission();
+      if (reqResult != PermissionRequestResult.GRANTED) {
+        print('Permission is denied.');
+        return false;
+      }
+    }
+
+    return true;
   }
 }
